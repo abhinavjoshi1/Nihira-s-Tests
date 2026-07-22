@@ -129,6 +129,13 @@ body{
 .slot .holder{flex:1;display:flex}
 .slot .holder .chip{width:100%;justify-content:flex-start;cursor:grab}
 
+/* Order (reorderable list) */
+.sortlist{display:flex;flex-direction:column;gap:11px}
+.sortrow{width:100%;justify-content:flex-start;padding:13px 15px;font-size:16.5px;cursor:grab}
+.sortrow.dragging{opacity:.35}
+.sortrow .pos{flex:0 0 auto;width:32px;height:32px;border-radius:50%;background:var(--plum);color:#fff;font-family:"Fredoka";font-weight:600;display:grid;place-items:center;font-size:16px;margin-right:2px}
+.sortrow .steplabel{font-weight:800}
+
 /* Match */
 .rows{display:flex;flex-direction:column;gap:12px}
 .mrow{display:grid;grid-template-columns:150px 1fr;gap:12px;align-items:center}
@@ -519,20 +526,18 @@ function onUp(e){
   drag.ghost.remove();
   drag=null;
 }
-/* placeChip: honor single-holder zones (swap), multi zones (append) */
+/* placeChip: honor single-holder zones (swap), multi zones (append).
+   Chips land in an inner .holder/.drop if the visible dropzone has one. */
+function holderOf(zone){return zone.querySelector(":scope > .holder, :scope > .drop")||zone;}
 function placeChip(chip,zone,origin){
-  const single=zone.classList.contains("single");
-  if(single){
-    const existing=zone.querySelector(".chip");
-    if(existing&&existing!==chip){
-      // swap: send existing back to chip's origin container
-      origin.appendChild(existing);
-    }
-    zone.appendChild(chip);
+  const h=holderOf(zone);
+  if(zone.classList.contains("single")){
+    const existing=h.querySelector(".chip");
+    if(existing&&existing!==chip) origin.appendChild(existing);
+    h.appendChild(chip);
   }else{
-    zone.appendChild(chip);
+    h.appendChild(chip);
   }
-  if(zone.dataset.onchange)window[zone.dataset.onchange]&&window[zone.dataset.onchange]();
   currentOnChange&&currentOnChange();
 }
 let currentOnChange=null;
@@ -622,10 +627,9 @@ function rBins(q,body){
   const grid=el("div","bins");
   const zones={};
   q.bins.forEach(b=>{
-    const bin=el("div","bin");
+    const bin=el("div","bin dropzone");bin.dataset.zone=b.key;
     bin.appendChild(el("h4",null,b.title));
-    const drop=el("div","bin drop dropzone");drop.classList.remove("bin");
-    drop.className="drop dropzone";drop.dataset.zone=b.key;
+    const drop=el("div","drop");
     bin.appendChild(drop);
     zones[b.key]=drop;
     grid.appendChild(bin);
@@ -655,53 +659,77 @@ function rBins(q,body){
 }
 function syncTrayEmpty(tray){tray.classList.toggle("empty",!tray.querySelector(".chip"));}
 
-/* Order */
+/* Order — reorder a single list, no separate slots */
 function rOrder(q,body){
-  const tray=el("div","tray dropzone");tray.dataset.zone="tray";
-  const slots=el("div","slots");
-  const slotEls=[];
-  q.order.forEach((_,i)=>{
-    const s=el("div","slot");
-    s.appendChild(el("div","num",i+1));
-    const holder=el("div","holder dropzone single");holder.dataset.zone="slot"+i;
-    s.appendChild(holder);
-    slots.appendChild(s);slotEls.push(holder);
+  const list=el("div","sortlist");
+  const saved=answers[q.id]&&answers[q.id].orderIds;
+  let ids;
+  if(saved) ids=saved.slice();
+  else if(q.preset) ids=q.preset.slice();
+  else ids=shuffle(q.items.map(i=>i.id));
+  ids=ids.filter(id=>q.items.find(i=>i.id===id));
+  q.items.forEach(i=>{if(!ids.includes(i.id))ids.push(i.id);});
+
+  ids.forEach(id=>{
+    const it=q.items.find(x=>x.id===id);
+    const row=el("div","chip sortrow");row.dataset.id=id;
+    row.innerHTML="<span class='pos'></span>"+(it.icon?ico(it.icon):"")+"<span class='grip'>⠿</span><span class='steplabel'>"+it.label+"</span>";
+    makeSortDrag(row,list,commit);
+    list.appendChild(row);
   });
-  body.appendChild(tray);body.appendChild(slots);
+  body.appendChild(list);
+  renumber(list);
 
-  const saved=answers[q.id]&&answers[q.id].place; // map id->zone
-  const preset=q.preset; // scrambled default (fix-diagram)
-  // build chip map
-  const chipmap={};
-  q.items.forEach(it=>{chipmap[it.id]=chipEl(it);});
-  if(saved){
-    q.items.forEach(it=>{
-      const z=saved[it.id];
-      if(z&&z.startsWith("slot"))slotEls[+z.slice(4)].appendChild(chipmap[it.id]);
-      else tray.appendChild(chipmap[it.id]);
-    });
-  }else if(preset){
-    preset.forEach((id,i)=>slotEls[i].appendChild(chipmap[id]));
-  }else{
-    // shuffle into tray
-    shuffle(q.items.slice()).forEach(it=>tray.appendChild(chipmap[it.id]));
+  function commit(touched){
+    renumber(list);
+    const order=[...list.querySelectorAll(".sortrow")].map(r=>r.dataset.id);
+    const correct=q.order.every((id,i)=>order[i]===id);
+    const prev=answers[q.id];
+    const done=touched?true:(prev?prev.done:false);
+    answers[q.id]={orderIds:order,done,correct};
+    persist();if(touched)flashSaved();updateNav();
   }
-  syncTrayEmpty(tray);
-
-  currentOnChange=function(){
-    const place={};let filled=0;
-    q.items.forEach(it=>{
-      const ch=body.querySelector(".chip[data-id='"+it.id+"']");
-      const z=ch.closest(".dropzone").dataset.zone;
-      place[it.id]=z;
-      if(z!=="tray")filled++;
-    });
-    const done=filled===q.order.length;
-    let correct=done&&q.order.every((id,i)=>place[id]==="slot"+i);
-    answers[q.id]={place,done,correct};
-    persist();flashSaved();syncTrayEmpty(tray);updateNav();
-  };
+  // record starting arrangement (not yet 'done' until she moves something)
+  commit(false);
 }
+
+/* pointer-based reorder within one list */
+function makeSortDrag(row,list,onChange){
+  row.addEventListener("pointerdown",e=>{
+    if(e.button!==undefined&&e.button!==0)return;
+    e.preventDefault();
+    const rect=row.getBoundingClientRect();
+    const ghost=row.cloneNode(true);ghost.classList.add("floating");
+    ghost.style.width=rect.width+"px";ghost.style.left=rect.left+"px";ghost.style.top=rect.top+"px";
+    document.body.appendChild(ghost);
+    row.classList.add("dragging");
+    const dx=e.clientX-rect.left,dy=e.clientY-rect.top;
+    row.setPointerCapture&&row.setPointerCapture(e.pointerId);
+    function move(ev){
+      ghost.style.left=(ev.clientX-dx)+"px";ghost.style.top=(ev.clientY-dy)+"px";
+      ghost.style.display="none";
+      const under=document.elementFromPoint(ev.clientX,ev.clientY);
+      ghost.style.display="";
+      const over=under&&under.closest?under.closest(".sortrow"):null;
+      if(over&&over!==row){
+        const r=over.getBoundingClientRect();
+        const before=ev.clientY < r.top+r.height/2;
+        list.insertBefore(row,before?over:over.nextSibling);
+        renumber(list);
+      }else if(under&&under.closest&&under.closest(".sortlist")&&!over){
+        list.appendChild(row);renumber(list);
+      }
+    }
+    function up(){
+      window.removeEventListener("pointermove",move);
+      row.classList.remove("dragging");ghost.remove();
+      onChange&&onChange(true);
+    }
+    window.addEventListener("pointermove",move);
+    window.addEventListener("pointerup",up,{once:true});
+  });
+}
+function renumber(list){[...list.querySelectorAll(".sortrow")].forEach((r,i)=>{const p=r.querySelector(".pos");if(p)p.textContent=i+1;});}
 
 /* Architecture (WhatsApp) */
 function rArch(q,body){
@@ -921,8 +949,7 @@ function labelFor(q,id){const o=(q.options||[]).find(x=>x.id===id);return o?o.la
 function rowLabel(q,id){const r=(q.rows||[]).find(x=>x.id===id);return r?r.label:id;}
 function describePlace(q,a){
   if(q.type==="order"){
-    const bySlot=[];Object.entries(a.place||{}).forEach(([id,z])=>{if(z&&z.startsWith("slot"))bySlot[+z.slice(4)]=itemLabel(q,id);});
-    return bySlot.map((l,i)=>(i+1)+"."+ (l||"?")).join("  ");
+    return (a.orderIds||[]).map((id,i)=>(i+1)+"."+itemLabel(q,id)).join("  ");
   }
   if(q.type==="arch"){
     const c=Object.keys(a.place||{}).find(k=>a.place[k]==="center");
